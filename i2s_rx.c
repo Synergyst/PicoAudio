@@ -57,17 +57,20 @@ bool i2s_rx_init(uint8_t data_pin) {
     return false;
   }
 
-  /* BCLK/LRCLK are already configured as outputs by the DAC I2S PIO
-     transmitter. Do not change their direction here: RX samples the same
-     clock pins while the DAC transmitter drives them. */
+  /*
+   * Both roles sample these clock pins. In master firmware they are driven
+   * by the local TX state machine; in slave firmware they are PIO inputs
+   * driven by the other board. The TX role initializer establishes their
+   * direction before capture is initialized here.
+   */
   pio_gpio_init(I2S_RX_PIO, data_pin);
   gpio_set_input_enabled(data_pin, true);
   gpio_disable_pulls(data_pin);
 
-  /* PIO WAIT instructions observe the physical clock pin levels. The pins
-     are shared with the DAC PIO state machine and remain under its control. */
   gpio_set_input_enabled(I2S_RX_BCLK_PIN, true);
   gpio_set_input_enabled(I2S_RX_LRCLK_PIN, true);
+  gpio_disable_pulls(I2S_RX_BCLK_PIN);
+  gpio_disable_pulls(I2S_RX_LRCLK_PIN);
 
   rx_sm = pio_claim_unused_sm(I2S_RX_PIO, true);
   rx_offset = pio_add_program(I2S_RX_PIO, &i2s_rx_program);

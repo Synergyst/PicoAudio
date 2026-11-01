@@ -6,11 +6,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(APP_NAME "mdac_adc2")
 set(BOARD_NAME "rp2040" CACHE STRING "Target SoC: rp2040 or rp2350")
+set(PICODAC_I2S_ROLE "master" CACHE STRING "I2S clock role: master or slave")
+set_property(CACHE PICODAC_I2S_ROLE PROPERTY STRINGS master slave)
 
 # Existing DAC output pin assignment.
 set(PICODAC_I2S_DATA_PIN 22 CACHE STRING "I2S transmit DATA pin")
 set(PICODAC_I2S_BASE_CLOCK_PIN 20 CACHE STRING "I2S BCLK pin; LRCLK is BASE + 1")
-# Separate digital I2S input pin. BCLK/LRCLK are shared with the DAC TX PIO.
+# Separate digital I2S input pin.
 set(PICODAC_I2S_RX_DATA_PIN 23 CACHE STRING "I2S receive DATA pin")
 set(PICODAC_VENDOR_ID 0xcafe CACHE STRING "USB Vendor ID")
 set(PICODAC_PRODUCT_ID 0xbabe CACHE STRING "USB Product ID")
@@ -23,11 +25,14 @@ else()
     message(FATAL_ERROR "Unsupported BOARD_NAME='${BOARD_NAME}'. Use rp2040 or rp2350.")
 endif()
 
+if(NOT PICODAC_I2S_ROLE STREQUAL "master" AND NOT PICODAC_I2S_ROLE STREQUAL "slave")
+    message(FATAL_ERROR "Unsupported PICODAC_I2S_ROLE='${PICODAC_I2S_ROLE}'. Use master or slave.")
+endif()
+
 # Allow an explicit board variant such as pico2_w from the command line.
-# Use a fresh build directory when changing silicon families so stale cache
-# values from the previous target cannot be reused.
+# Use a fresh build directory when changing silicon families or I2S roles.
 set(PICO_BOARD "${_default_pico_board}" CACHE STRING "Pico SDK board type")
-message(STATUS "Target SoC: ${BOARD_NAME}; Pico SDK board: ${PICO_BOARD}")
+message(STATUS "Target SoC: ${BOARD_NAME}; Pico SDK board: ${PICO_BOARD}; I2S role: ${PICODAC_I2S_ROLE}")
 
 if(WIN32)
     set(USERHOME $ENV{USERPROFILE})
@@ -75,6 +80,12 @@ set(_mdac_compile_definitions
     PRODUCT_ID=${PICODAC_PRODUCT_ID}
 )
 
+if(PICODAC_I2S_ROLE STREQUAL "master")
+    list(APPEND _mdac_compile_definitions PICODAC_I2S_ROLE_MASTER=1)
+else()
+    list(APPEND _mdac_compile_definitions PICODAC_I2S_ROLE_SLAVE=1)
+endif()
+
 # The original custom 92.16 MHz PLL setup is RP2040-specific. Do not raise
 # RP2350's documented PLL VCO limit to accommodate that RP2040 configuration.
 if(BOARD_NAME STREQUAL "rp2040")
@@ -82,9 +93,7 @@ if(BOARD_NAME STREQUAL "rp2040")
 endif()
 
 # Pico 2 W has no directly accessible PICO_DEFAULT_LED_PIN; its status LED is
-# attached to the CYW43 wireless chip. This firmware does not initialize the
-# CYW43, so disable the PIO-based status LED rather than driving GPIO25 (the
-# CYW43 chip-select pin) as though it were an ordinary onboard LED.
+# attached to the CYW43 wireless chip. This firmware does not initialize CYW43.
 if(PICO_BOARD STREQUAL "pico2_w")
     list(APPEND _mdac_compile_definitions PICODAC_NO_PIO_LED=1)
 endif()
@@ -95,11 +104,12 @@ target_include_directories(mdac_adc2 PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 pico_generate_pio_header(mdac_adc2
     ${CMAKE_CURRENT_LIST_DIR}/blink.pio
     ${CMAKE_CURRENT_LIST_DIR}/i2s.pio
+    ${CMAKE_CURRENT_LIST_DIR}/i2s_slave.pio
     ${CMAKE_CURRENT_LIST_DIR}/i2s_rx.pio
 )
 
 pico_set_program_name(mdac_adc2 "mdac_adc2")
-pico_set_program_version(mdac_adc2 "0.3")
+pico_set_program_version(mdac_adc2 "0.4")
 pico_enable_stdio_uart(mdac_adc2 1)
 pico_enable_stdio_usb(mdac_adc2 0)
 pico_add_extra_outputs(mdac_adc2)

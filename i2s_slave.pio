@@ -1,0 +1,72 @@
+.program i2s_stereo_slave
+; 32-bit stereo I2S transmitter synchronized to external clocks.
+;
+; GPIO20 = external BCLK input
+; GPIO21 = external LRCLK input
+; DATA output pin is configured by i2s_slave_program_init().
+;
+; The master is the only clock source. This program must never stall waiting
+; for sample data: if the TX FIFO is empty, PULL NOBLOCK loads X (held at zero)
+; into OSR and transmits a zero sample. That preserves every external BCLK
+; edge and prevents a temporary DMA/USB scheduling delay from shifting the
+; slave's bit/channel alignment.
+;
+; X is the zero fallback word. Y is the per-word bit counter.
+
+    set x, 0
+
+    ; Synchronize to LRCLK high-to-low (start of the left slot).
+    wait 1 gpio 21
+    wait 0 gpio 21
+
+    ; Skip the I2S boundary edge. The master emits the left MSB on the
+    ; following falling edge, after this first rising/falling pair.
+    wait 1 gpio 20
+    wait 0 gpio 20
+
+.wrap_target
+    ; Left channel: load one word without ever blocking on an empty FIFO.
+    pull noblock
+    set y, 31
+left_bit:
+    out pins, 1
+    wait 1 gpio 20
+    wait 0 gpio 20
+    jmp y-- left_bit
+
+    ; Right channel.
+    pull noblock
+    set y, 31
+right_bit:
+    out pins, 1
+    wait 1 gpio 20
+    wait 0 gpio 20
+    jmp y-- right_bit
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+#include "i2s.h"
+
+static inline void i2s_slave_program_init(PIO pio, uint sm, uint offset,
+                                          const i2s_config_t *config) {
+    pio_gpio_init(pio, config->data_pin);
+    pio_gpio_init(pio, config->clock_pin_base);
+    pio_gpio_init(pio, config->clock_pin_base + 1);
+
+    pio_sm_config sm_config = i2s_stereo_slave_program_get_default_config(offset);
+    sm_config_set_out_pins(&sm_config, config->data_pin, 1);
+    /* Manual PULL NOBLOCK, not autopull: empty FIFO must never stall OUT. */
+    sm_config_set_out_shift(&sm_config, false, false, 32);
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
+    sm_config_set_clkdiv(&sm_config, 1.0f);
+
+    pio_sm_init(pio, sm, offset, &sm_config);
+
+    /* DATA is an output; externally supplied BCLK/LRCLK remain inputs. */
+    const uint32_t pin_mask = (1u << config->data_pin) |
+                              (3u << config->clock_pin_base);
+    const uint32_t pin_directions = (1u << config->data_pin);
+    pio_sm_set_pindirs_with_mask(pio, sm, pin_directions, pin_mask);
+}
+%}

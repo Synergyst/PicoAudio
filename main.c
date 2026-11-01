@@ -15,8 +15,7 @@ int main(void) {
 #if PICO_RP2350
   /*
    * Use the standard 150 MHz RP2350 system clock. The 1.5 GHz PLL VCO
-   * is within the RP2350 limit; the PIO clock divider handles the I2S
-   * sample rate from this system clock.
+   * is within the RP2350 limit; the PIO clock divider handles the I2S rate.
    */
   set_sys_clock_pll(12 * MHZ * 125u, 5, 2);
 #else
@@ -39,7 +38,11 @@ int main(void) {
   usb_hid_init();
 #endif
 
-  LOG_INFO("Booted: USB UAC2 playback + capture");
+#if defined(PICODAC_I2S_ROLE_SLAVE)
+  LOG_INFO("Booted: USB UAC2 playback + capture; I2S CLOCK SLAVE");
+#else
+  LOG_INFO("Booted: USB UAC2 playback + capture; I2S CLOCK MASTER");
+#endif
 
   while (true) {
     usb_device_task();

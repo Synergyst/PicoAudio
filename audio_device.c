@@ -128,6 +128,7 @@ void audio_device_task(void) {
         int32_t *i2s_buf = i2s_get_write_buffer();
         const uint32_t frames = i2s_get_buffer_size_frames(&i2s_config);
         memset(i2s_buf, 0, frames * sizeof(int32_t) * 2u);
+        i2s_submit_write_buffer();
       }
       break;
 
@@ -174,6 +175,7 @@ void audio_device_task(void) {
             i2s_buf[2u * i + 1u] = (int32_t)right;
           }
         }
+        i2s_submit_write_buffer();
       }
       break;
   }

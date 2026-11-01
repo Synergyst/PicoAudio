@@ -1,66 +1,103 @@
-# Dual-board Pico DAC2 build and deployment
+# PicoAudio board builds and deployment
 
-This adds a Makefile-based workflow for the two supported boards. It builds
-separate firmware images because the Pico 1 is RP2040 and the Pico 2 W is
-RP2350; an RP2350 UF2 must not be flashed onto the RP2040 board (or vice versa).
+PicoAudio builds board-specific firmware for three Raspberry Pi Pico models and two I²S clock roles. Select the board model and role independently:
 
-## Commands
+- Boards: `pico1`, `pico2`, `pico2w`
+- Roles: `master`, `slave`
+
+RP2040 and RP2350 firmware images are not interchangeable. Master and slave images also have different clock-pin behavior and must be flashed according to the intended topology.
+
+## Build one board/role combination
+
+Use `BOARD` and `ROLE` with the generic build target:
 
 ```sh
-make help
-make build             # Build both board-specific UF2 files
-make build-pico1       # RP2040 / Raspberry Pi Pico 1
-make build-pico2w      # RP2350 / Raspberry Pi Pico 2 W
-make deploy            # Build both, detect BOOTSEL volumes, and flash them
-make status            # Inspect connected runtime devices and BOOTSEL volumes
-make clean             # Remove the two Makefile-managed build directories
+make build BOARD=pico1 ROLE=master
+make build BOARD=pico2 ROLE=slave
+make build BOARD=pico2w ROLE=master
 ```
 
-The builds use GPIO26 for I2S RX DATA and retain GPIO22 for I2S TX DATA. No
-additional `-D` parameters are needed when using these Makefile targets.
+The same combinations are available through `build-one`:
 
-Output images:
+```sh
+make build-one BOARD=pico2 ROLE=master
+```
 
-- `build-pico1/mdac_adc2.uf2` — RP2040 / `PICO_BOARD=pico`
-- `build-pico2w/mdac_adc2.uf2` — RP2350 / `PICO_BOARD=pico2_w`
+Convenience targets use the selected `ROLE` variable, defaulting to `master`:
 
-## Automatic deployment
+```sh
+make build-pico1 [ROLE=master|slave]
+make build-pico2 [ROLE=master|slave]
+make build-pico2w [ROLE=master|slave]
+```
 
-`make deploy` first builds both firmware images, then scans USB mass-storage
-partitions for the BOOTSEL labels:
+The predefined bridge pair remains available:
 
-- `RPI-RP2` identifies the RP2040 Pico 1 bootloader.
-- `RP2350` identifies the RP2350 Pico 2 W bootloader.
+```sh
+make build-bridge
+```
 
-It flashes whichever supported board(s) are currently in BOOTSEL. If one or
-more of the project's firmware devices are running normally instead, it asks
-you to hold BOOTSEL while reconnecting those boards and press Enter to rescan.
-It uses a private temporary mount directory under `/run` when a BOOTSEL
-partition is not already mounted. If the current device is already mounted,
-it uses that exact device's existing mount only after checking that the mount is
-readable. It never blindly stacks another mount on `/mnt/pico`; an unreadable
-stale mount is reported and no UF2 is copied.
+It builds:
 
-The two boards use the same runtime USB IDs (`cafe:babe`, with the earlier
-capture-only build also using `cafe:babf`). Those descriptors do not identify
-the silicon family. The Makefile therefore identifies the exact model only
-when the board is in BOOTSEL, using its boot-volume label. It counts running
-project firmware devices so it can tell whether additional boards still need
-to be placed in BOOTSEL.
+- `build-pico2w/mdac_adc2.uf2` — Pico 2 W / RP2350 / master.
+- `build-pico2-slave/mdac_adc2.uf2` — Pico 2 (non-W) / RP2350 / slave.
 
-Deployment expects at most one Pico 1 and one Pico 2 W, matching this setup.
-Run `make deploy` as root (or with sudo) because it mounts BOOTSEL volumes.
+Build output directories are kept separate for each model and role:
 
-## Pico 2 W status LED
+| Model | Master build directory | Slave build directory |
+|---|---|---|
+| Pico 1 | `build-pico1` | `build-pico1-slave` |
+| Pico 2 | `build-pico2-master` | `build-pico2-slave` |
+| Pico 2 W | `build-pico2w` | `build-pico2w-slave` |
 
-Unlike the non-wireless Pico 2, the Pico 2 W has no normal GPIO
-`PICO_DEFAULT_LED_PIN`; its onboard LED is connected to the CYW43 wireless
-chip. This firmware does not initialize the CYW43. The Pico 2 W build therefore
-uses no-op status LED functions rather than driving GPIO25, which is the
-CYW43 chip-select pin. Audio pins and USB audio behavior are unchanged.
+## Interactive deployment
 
-## SDK
+Run deployment as root so the helper can mount BOOTSEL volumes:
 
-The Makefile uses the existing `PICO_SDK_PATH` environment variable and the
-project's existing `pico_sdk_import.cmake`. Keep that environment variable set
-to the Pico SDK checkout used by this project.
+```sh
+make deploy
+```
+
+The helper identifies the silicon family from the BOOTSEL volume label:
+
+- `RPI-RP2` identifies Pico 1 / RP2040 automatically.
+- `RP2350` identifies an RP2350 board, but **cannot distinguish Pico 2 from Pico 2 W**. The helper asks which physical model is currently in BOOTSEL.
+
+The helper also asks whether to flash `master` or `slave`, unless you provide that role explicitly. It builds the selected image and flashes only the selected BOOTSEL partition.
+
+For non-interactive selection, specify both values:
+
+```sh
+make deploy BOARD=pico1 ROLE=master
+make deploy BOARD=pico2 ROLE=slave
+make deploy BOARD=pico2w ROLE=master
+```
+
+If multiple supported BOOTSEL volumes are connected, the helper asks which device path belongs to the physical board being flashed. Since Pico 2 and Pico 2 W share the same RP2350 bootloader identity, the operator must identify the physical board; software cannot infer the W variant from the BOOTSEL label. The safest procedure is to place only the intended board into BOOTSEL for each deployment.
+
+You can also provide a specific partition path when needed:
+
+```sh
+make deploy BOARD=pico2w ROLE=master DEVICE=/dev/sdX1
+```
+
+Replace `/dev/sdX1` with the actual partition shown by `make status` or `lsblk`.
+
+`make deploy` builds the selected image automatically. It does not flash every connected board indiscriminately; each invocation flashes one selected BOOTSEL device. Run it again for the next board.
+
+## Status and cleanup
+
+```sh
+make status
+make clean
+```
+
+`make status` lists recognized BOOTSEL volumes and running PicoAudio USB devices. The current USB descriptors do not expose the firmware role, and a running USB device does not identify whether it is Pico 2 or Pico 2 W.
+
+`make clean` removes only the six Makefile-managed board/role build directories.
+
+## Hardware role reminder
+
+The master drives GP20 BCLK and GP21 LRCLK. The slave receives those clocks. Data is crossed in each direction: master GP22 to slave GP26, and slave GP22 to master GP26. Connect GND to GND. Keep the boards independently USB-powered; do not connect VBUS, VSYS, or 3V3 between them.
+
+The master must have an active USB playback stream to generate I²S clocks. Both boards should use the same nominal sample rate. See [README-DUAL-BOARD-ROLES.md](README-DUAL-BOARD-ROLES.md) for the wiring and staged audio tests.

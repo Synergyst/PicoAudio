@@ -2,70 +2,223 @@
 set -Eeuo pipefail
 
 MODE="${1:-status}"
-PICO1_UF2="${2:-}"
-PICO2W_UF2="${3:-}"
+REQUESTED_BOARD="${BOARD:-}"
+REQUESTED_ROLE="${ROLE:-}"
+REQUESTED_DEVICE="${DEVICE:-}"
+JOBS="${JOBS:-4}"
+RX_DATA_PIN="${RX_DATA_PIN:-26}"
+CMAKE_BIN="${CMAKE:-cmake}"
 
-PICO1_LABEL="RPI-RP2"
-PICO2W_LABEL="RP2350"
-RUNTIME_IDS_RE='ID cafe:(babe|babf)'
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-if [[ "$MODE" != "status" && "$MODE" != "deploy" ]]; then
-  echo "Usage: $0 {status|deploy} [pico1.uf2 pico2w.uf2]" >&2
-  exit 2
-fi
+usage() {
+  cat <<'USAGE'
+Usage:
+  make deploy [BOARD=pico1|pico2|pico2w] [ROLE=master|slave] [DEVICE=/dev/sdX1]
+  make status
 
-if [[ "$MODE" == "deploy" ]]; then
-  [[ -f "$PICO1_UF2" ]] || { echo "Missing Pico 1 UF2: $PICO1_UF2" >&2; exit 1; }
-  [[ -f "$PICO2W_UF2" ]] || { echo "Missing Pico 2 W UF2: $PICO2W_UF2" >&2; exit 1; }
-  if (( EUID != 0 )); then
-    echo "Deployment needs root privileges to mount BOOTSEL volumes." >&2
-    echo "Run: sudo make deploy" >&2
-    exit 1
-  fi
-fi
+If BOARD is omitted, the RPI-RP2 label identifies Pico 1 automatically.
+An RP2350 BOOTSEL volume requires a Pico 2 vs Pico 2 W choice because both
+models expose the same RP2350 boot volume label. ROLE is prompted unless set.
+USAGE
+}
 
-boot_partitions() {
-  local wanted_label="$1"
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+prompt_value() {
+  local prompt_text="$1"
+  local answer
+  [[ -r /dev/tty ]] || fail "Interactive selection requires a terminal. Specify BOARD= and ROLE= explicitly."
+  printf '%s' "$prompt_text" > /dev/tty
+  IFS= read -r answer < /dev/tty || fail "Could not read selection from terminal."
+  printf '%s' "$answer"
+}
+
+normalize_board() {
+  case "${1,,}" in
+    pico1|pico|rp2040) printf 'pico1' ;;
+    pico2|rp2350|pico-2) printf 'pico2' ;;
+    pico2w|pico2_w|pico-2-w|pico2-w) printf 'pico2w' ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_role() {
+  case "${1,,}" in
+    master|m) printf 'master' ;;
+    slave|s) printf 'slave' ;;
+    *) return 1 ;;
+  esac
+}
+
+expected_label_for_board() {
+  case "$1" in
+    pico1) printf 'RPI-RP2' ;;
+    pico2|pico2w) printf 'RP2350' ;;
+    *) return 1 ;;
+  esac
+}
+
+build_dir_for() {
+  case "$1-$2" in
+    pico1-master) printf 'build-pico1' ;;
+    pico1-slave) printf 'build-pico1-slave' ;;
+    pico2-master) printf 'build-pico2-master' ;;
+    pico2-slave) printf 'build-pico2-slave' ;;
+    pico2w-master) printf 'build-pico2w' ;;
+    pico2w-slave) printf 'build-pico2w-slave' ;;
+    *) return 1 ;;
+  esac
+}
+
+boot_entries() {
   lsblk -rpn -o NAME,LABEL,TYPE 2>/dev/null |
-    awk -v wanted="$wanted_label" '$2 == wanted && $3 == "part" { print $1 }'
+    awk '$3 == "part" && ($2 == "RPI-RP2" || $2 == "RP2350") { print $1 "|" $2 }'
 }
 
-runtime_device_count() {
-  lsusb 2>/dev/null | awk '$5 == "ID" && ($6 == "cafe:babe" || $6 == "cafe:babf") { count++ } END { print count+0 }'
+runtime_devices() {
+  lsusb 2>/dev/null | awk '/ID cafe:(babe|babf)/ { print }' || true
 }
 
-line_count() {
-  local value="${1:-}"
-  if [[ -z "$value" ]]; then
-    echo 0
+show_status() {
+  local entries running
+  entries="$(boot_entries || true)"
+  running="$(runtime_devices)"
+
+  echo 'PicoAudio BOOTSEL devices:'
+  if [[ -n "$entries" ]]; then
+    while IFS='|' read -r device label; do
+      [[ -n "$device" ]] || continue
+      case "$label" in
+        RPI-RP2) printf '  %-12s %-8s %s\n' "$device" "$label" 'Pico 1 / RP2040' ;;
+        RP2350) printf '  %-12s %-8s %s\n' "$device" "$label" 'Pico 2 or Pico 2 W / RP2350 (model indistinguishable in BOOTSEL)' ;;
+      esac
+    done <<< "$entries"
   else
-    printf '%s\n' "$value" | awk 'NF { n++ } END { print n+0 }'
+    echo '  none'
   fi
+
+  echo 'Running PicoAudio USB devices:'
+  if [[ -n "$running" ]]; then
+    printf '%s\n' "$running" | sed 's/^/  /'
+  else
+    echo '  none'
+  fi
+  echo 'Note: the current USB descriptors do not identify the board model or I2S role after boot.'
+}
+
+select_boot_device() {
+  local entries=() filtered=() line dev label expected answer index
+  mapfile -t entries < <(boot_entries)
+
+  if [[ -n "$REQUESTED_BOARD" ]]; then
+    REQUESTED_BOARD="$(normalize_board "$REQUESTED_BOARD")" || fail "Unknown BOARD. Use pico1, pico2, or pico2w."
+    expected="$(expected_label_for_board "$REQUESTED_BOARD")"
+    for line in "${entries[@]}"; do
+      IFS='|' read -r dev label <<< "$line"
+      [[ "$label" == "$expected" ]] && filtered+=("$line")
+    done
+  else
+    filtered=("${entries[@]}")
+  fi
+
+  ((${#filtered[@]} > 0)) || {
+    echo 'No matching Pico BOOTSEL partition was found.' >&2
+    echo 'Detected BOOTSEL partitions:' >&2
+    if ((${#entries[@]})); then printf '  %s\n' "${entries[@]}" >&2; else echo '  none' >&2; fi
+    echo 'Hold BOOTSEL while reconnecting the board, then run make deploy again.' >&2
+    exit 1
+  }
+
+  if [[ -n "$REQUESTED_DEVICE" ]]; then
+    for line in "${filtered[@]}"; do
+      IFS='|' read -r dev label <<< "$line"
+      [[ "$dev" == "$REQUESTED_DEVICE" ]] && { printf '%s|%s' "$dev" "$label"; return; }
+    done
+    fail "DEVICE=$REQUESTED_DEVICE is not among the matching BOOTSEL partitions."
+  fi
+
+  if ((${#filtered[@]} == 1)); then
+    printf '%s' "${filtered[0]}"
+    return
+  fi
+
+  printf 'Multiple BOOTSEL volumes are connected:\n' > /dev/tty
+  for index in "${!filtered[@]}"; do
+    IFS='|' read -r dev label <<< "${filtered[$index]}"
+    printf '  %d) %s (%s)\n' "$((index + 1))" "$dev" "$label" > /dev/tty
+  done
+  answer="$(prompt_value 'Select the volume belonging to the physical board you want to flash: ')"
+  [[ "$answer" =~ ^[0-9]+$ ]] || fail 'Selection must be a number.'
+  (( answer >= 1 && answer <= ${#filtered[@]} )) || fail 'Selection is out of range.'
+  printf '%s' "${filtered[$((answer - 1))]}"
+}
+
+select_board() {
+  local detected_label="$1" choice
+  if [[ -n "$REQUESTED_BOARD" ]]; then
+    REQUESTED_BOARD="$(normalize_board "$REQUESTED_BOARD")" || fail 'BOARD must be pico1, pico2, or pico2w.'
+    [[ "$(expected_label_for_board "$REQUESTED_BOARD")" == "$detected_label" ]] ||
+      fail "BOARD=$REQUESTED_BOARD does not match BOOTSEL label $detected_label."
+    printf '%s' "$REQUESTED_BOARD"
+    return
+  fi
+
+  if [[ "$detected_label" == 'RPI-RP2' ]]; then
+    printf 'pico1'
+    return
+  fi
+
+  echo 'The RP2350 BOOTSEL label is shared by Pico 2 and Pico 2 W.' > /dev/tty
+  echo 'Which physical board is currently in BOOTSEL?' > /dev/tty
+  echo '  1) Raspberry Pi Pico 2 (non-W)' > /dev/tty
+  echo '  2) Raspberry Pi Pico 2 W' > /dev/tty
+  choice="$(prompt_value 'Select 1 or 2: ')"
+  case "$choice" in
+    1) printf 'pico2' ;;
+    2) printf 'pico2w' ;;
+    *) fail 'Board selection must be 1 or 2.' ;;
+  esac
+}
+
+select_role() {
+  local choice
+  if [[ -n "$REQUESTED_ROLE" ]]; then
+    REQUESTED_ROLE="$(normalize_role "$REQUESTED_ROLE")" || fail 'ROLE must be master or slave.'
+    printf '%s' "$REQUESTED_ROLE"
+    return
+  fi
+
+  echo 'Which I2S clock role should this firmware use?' > /dev/tty
+  echo '  1) Master (generates BCLK and LRCLK)' > /dev/tty
+  echo '  2) Slave (receives BCLK and LRCLK)' > /dev/tty
+  choice="$(prompt_value 'Select 1 or 2: ')"
+  case "$choice" in
+    1) printf 'master' ;;
+    2) printf 'slave' ;;
+    *) fail 'Role selection must be 1 or 2.' ;;
+  esac
 }
 
 flash_volume() {
-  local device="$1"
-  local board_name="$2"
-  local uf2="$3"
-  local mount_dir=""
-  local created_mount=0
-  local existing_mount=""
+  local device="$1" board="$2" role="$3" uf2="$4"
+  local mount_dir='' created_mount=0 existing_mount=''
 
-  if [[ ! -b "$device" ]]; then
-    echo "[$board_name] BOOTSEL device disappeared: $device" >&2
-    return 1
-  fi
-
+  [[ -b "$device" ]] || fail "BOOTSEL partition disappeared: $device"
   existing_mount="$(findmnt -rn -S "$device" -o TARGET 2>/dev/null | head -n 1 || true)"
+
   if [[ -n "$existing_mount" ]]; then
     mount_dir="$existing_mount"
   else
-    mount_dir="$(mktemp -d "/run/pico-dac2-${board_name}.XXXXXX")"
+    mount_dir="$(mktemp -d "/run/picoaudio-${board}-${role}.XXXXXX")"
     created_mount=1
     if ! mount "$device" "$mount_dir"; then
       rmdir "$mount_dir" 2>/dev/null || true
-      echo "[$board_name] Could not mount $device" >&2
-      return 1
+      fail "Could not mount $device. No UF2 was copied."
     fi
   fi
 
@@ -74,124 +227,63 @@ flash_volume() {
       umount "$mount_dir" 2>/dev/null || true
       rmdir "$mount_dir" 2>/dev/null || true
     fi
-    echo "[$board_name] BOOTSEL mount is unavailable or stale at $mount_dir" >&2
-    echo "Clear the stale mount and run 'make deploy' again; no UF2 was copied." >&2
-    return 1
+    fail "BOOTSEL mount is unavailable or stale at $mount_dir. No UF2 was copied."
   fi
 
-  echo "[$board_name] Flashing $uf2 to $device ..."
+  echo "[$board / $role] Flashing $uf2 to $device ..."
   if ! cp -- "$uf2" "$mount_dir/mdac_adc2.uf2"; then
     if (( created_mount )); then
       umount "$mount_dir" 2>/dev/null || true
       rmdir "$mount_dir" 2>/dev/null || true
     fi
-    echo "[$board_name] Copy failed." >&2
-    return 1
+    fail "UF2 copy failed for $device."
   fi
-
   sync
+
   if (( created_mount )); then
-    # BOOTSEL normally disconnects itself after accepting a UF2. If it has
-    # not disconnected, clean up the temporary mount normally.
     if findmnt -rn -M "$mount_dir" >/dev/null 2>&1; then
       umount "$mount_dir" 2>/dev/null || true
     fi
     rmdir "$mount_dir" 2>/dev/null || true
   fi
 
-  echo "[$board_name] UF2 copied successfully. The board should reboot."
+  echo "[$board / $role] UF2 copied successfully. The board should reboot."
 }
 
-show_status() {
-  local pico1 pico2w running
-  pico1="$(boot_partitions "$PICO1_LABEL")"
-  pico2w="$(boot_partitions "$PICO2W_LABEL")"
-  running="$(runtime_device_count)"
+run_deploy() {
+  local selected device label board role build_dir uf2
 
-  echo "Pico 1 (RP2040) BOOTSEL partitions ($PICO1_LABEL):"
-  if [[ -n "$pico1" ]]; then printf '  %s\n' "$pico1"; else echo '  none'; fi
-  echo "Pico 2 W (RP2350) BOOTSEL partitions ($PICO2W_LABEL):"
-  if [[ -n "$pico2w" ]]; then printf '  %s\n' "$pico2w"; else echo '  none'; fi
-  echo "Running pico-dac2 firmware devices (cafe:babe / cafe:babf): $running"
-  echo "Note: runtime firmware uses the same USB IDs on both models, so silicon type is only unambiguous in BOOTSEL."
+  (( EUID == 0 )) || fail "Deployment requires root to mount BOOTSEL volumes. Run: sudo -E make deploy"
+  selected="$(select_boot_device)"
+  IFS='|' read -r device label <<< "$selected"
+  board="$(select_board "$label")"
+  role="$(select_role)"
+  build_dir="$(build_dir_for "$board" "$role")"
+
+  echo "Selected target: board=$board, role=$role, BOOTSEL=$device ($label)"
+  echo 'Building the matching firmware image...'
+  cd "$PROJECT_ROOT"
+  make --no-print-directory build-one \
+    BOARD="$board" ROLE="$role" JOBS="$JOBS" \
+    RX_DATA_PIN="$RX_DATA_PIN" CMAKE="$CMAKE_BIN"
+
+  uf2="$PROJECT_ROOT/$build_dir/mdac_adc2.uf2"
+  [[ -f "$uf2" ]] || fail "Build completed without producing $uf2"
+  flash_volume "$device" "$board" "$role" "$uf2"
 }
 
-if [[ "$MODE" == "status" ]]; then
-  show_status
-  exit 0
-fi
-
-flashed_pico1=0
-flashed_pico2w=0
-expected_total=0
-
-while true; do
-  pico1_devices="$(boot_partitions "$PICO1_LABEL")"
-  pico2w_devices="$(boot_partitions "$PICO2W_LABEL")"
-  pico1_count="$(line_count "$pico1_devices")"
-  pico2w_count="$(line_count "$pico2w_devices")"
-  running_count="$(runtime_device_count)"
-  visible_total=$((pico1_count + pico2w_count + running_count))
-  if (( visible_total > expected_total )); then
-    expected_total="$visible_total"
-  fi
-
-  did_flash=0
-
-  if (( pico1_count > 0 && flashed_pico1 == 0 )); then
-    while IFS= read -r device; do
-      [[ -n "$device" ]] || continue
-      flash_volume "$device" "pico1-rp2040" "$PICO1_UF2"
-      flashed_pico1=1
-      did_flash=1
-      break
-    done <<< "$pico1_devices"
-  fi
-
-  if (( pico2w_count > 0 && flashed_pico2w == 0 )); then
-    while IFS= read -r device; do
-      [[ -n "$device" ]] || continue
-      flash_volume "$device" "pico2w-rp2350" "$PICO2W_UF2"
-      flashed_pico2w=1
-      did_flash=1
-      break
-    done <<< "$pico2w_devices"
-  fi
-
-  # One of each board is the intended deployment pair. The total includes
-  # BOOTSEL volumes and runtime devices, so a board that reboots after flashing
-  # is not mistaken for a second, unflashed board.
-  flashed_count=$((flashed_pico1 + flashed_pico2w))
-  if (( expected_total < flashed_count )); then
-    expected_total="$flashed_count"
-  fi
-  remaining=$((expected_total - flashed_count))
-  if (( remaining <= 0 )); then
-    if (( flashed_count > 0 )); then
-      echo "Deployment complete: flashed $flashed_count board(s)."
-      exit 0
-    fi
-  fi
-
-  if (( did_flash )); then
-    sleep 3
-    continue
-  fi
-
-  if (( remaining > 0 )); then
-    echo
-    echo "Detected $running_count running firmware device(s), and $((pico1_count + pico2w_count)) BOOTSEL volume(s)."
-    echo "$remaining board(s) still need to be placed in BOOTSEL."
-    echo "Hold BOOTSEL while reconnecting each remaining board."
-    echo "Pico 1 appears as the RPI-RP2 volume; Pico 2 W appears as RP2350."
-    read -r -p "Press Enter after putting the next board (or both boards) into BOOTSEL, or Ctrl-C to cancel. " _
-    continue
-  fi
-
-  if (( running_count == 0 && pico1_count == 0 && pico2w_count == 0 )); then
-    echo "No supported Pico running this firmware or in BOOTSEL was detected." >&2
-    echo "Connect the Pico 1 and/or Pico 2 W, then run 'make deploy' again." >&2
-    exit 1
-  fi
-
-done
+case "$MODE" in
+  status)
+    show_status
+    ;;
+  deploy)
+    run_deploy
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
