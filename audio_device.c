@@ -4,45 +4,34 @@
 #include <string.h>
 
 #include "blink.h"
-#include "i2s.h"
 #include "log.h"
 #include "ringbuffer.h"
+#include "gpio_audio_link.h"
 
-//--------------------------------------------------------------------+/
-// MACRO CONSTANT TYPEDEF PROTOTYPES
-//--------------------------------------------------------------------+/
+#define SAFE_WATER_LEVEL 0.5f
+#define UNDERRUN_WATER_LEVEL 0.16f
+#define RECOVERY_WATER_LEVEL 0.4f
+#define LINK_TX_TARGET_MS 8u
+#define LINK_TX_LOW_WATER_MS 2u
+#define LINK_TX_MAX_MOVE_FRAMES 192u
+#define STEREO_FRAME_BYTES (sizeof(int32_t) * 2u)
 
-// --- Configuration ---
-#define I2S_DATA_PIN PICODAC_I2S_DATA_PIN
-#define I2S_CLOCK_PIN_BASE PICODAC_I2S_BASE_CLOCK_PIN  // LRCLK = BASE + 1
-#define SAFE_WATER_LEVEL 0.5
-#define UNDERRUN_WATER_LEVEL 0.16
-#define RECOVERY_WATER_LEVEL 0.4
-#define PIO pio0
-
-// 256 刻みで指定
-// Volume range: -96 dB through 0 dB, in 1 dB steps.
 enum {
   VOLUME_CTRL_0_DB = 0,
   VOLUME_CTRL_96_DB = 96 * 256,
 };
 
-// --- Module-level Static Variables ---
 static ringbuffer_t rb;
 static app_state_t g_current_state;
-static i2s_config_t i2s_config;
+static uint32_t current_sample_rate = 48000u;
+static uint8_t current_bit_depth = 16u;
+static float steady_buffer_fill_ratio;
 
-static uint32_t current_sample_rate = 48000;
-static uint8_t current_bit_depth = 16;
-
-static float steady_buffer_fill_ratio = 0;
-
-// Audio controls - Current states. Index 0 is master, 1 is left, 2 is right.
 static int8_t mute[3] = {0, 0, 0};
 static int16_t volume[3] = {VOLUME_CTRL_0_DB, VOLUME_CTRL_0_DB,
                             VOLUME_CTRL_0_DB};
 
-// Precomputed gain table: round(10^(dB/20) * 2^31), from -96 dB to 0 dB.
+/* round(10^(dB/20) * 2^31), from -96 dB through 0 dB in 1 dB steps. */
 static const uint32_t gain_lookup_table[97] = {
     0x000084f3, 0x0000952c, 0x0000a760, 0x0000bbcc, 0x0000d2b6, 0x0000ec6c,
     0x00010945, 0x000129a4, 0x00014df5, 0x000176b5, 0x0001a46d, 0x0001d7ba,
@@ -64,46 +53,70 @@ static const uint32_t gain_lookup_table[97] = {
 };
 
 static bool sample_rate_supported(uint32_t sample_rate) {
-  switch (sample_rate) {
-    case 44100:
-    case 48000:
-      return true;
-    default:
-      return false;
-  }
+  return sample_rate == 44100u || sample_rate == 48000u;
 }
 
 static uint32_t calc_buffer_size(uint32_t sample_rate) {
-  // sample_rate * 2 channels * 16 ms * 4 bytes/sample.
-  return sample_rate * 2u * 16u * 4u / 1000u;
+  /* 16 ms, rounded up to a whole interleaved stereo S32 frame. */
+  const uint32_t frames = (sample_rate * 16u + 999u) / 1000u;
+  return frames * (uint32_t)STEREO_FRAME_BYTES;
 }
 
-//--------------------------------------------------------------------+/
-// Initialization
-//--------------------------------------------------------------------+/
+static uint32_t playback_ring_frames(void) {
+  if (rb.size == 0) return 0;
+  return (uint32_t)(ringbuffer_fill_ratio(&rb) * (float)rb.size) /
+         (uint32_t)STEREO_FRAME_BYTES;
+}
+
+static void update_steady_fill_ratio(void) {
+  const uint32_t buffered_frames =
+      playback_ring_frames() + gpio_audio_link_get_tx_queued_frames();
+  const uint32_t nominal_capacity_frames =
+      (current_sample_rate * 24u) / 1000u; /* 16 ms local + 8 ms GPIO-link queue */
+  if (nominal_capacity_frames == 0) {
+    steady_buffer_fill_ratio = 0.0f;
+  } else {
+    steady_buffer_fill_ratio =
+        (float)buffered_frames / (float)nominal_capacity_frames;
+    if (steady_buffer_fill_ratio > 1.0f) steady_buffer_fill_ratio = 1.0f;
+  }
+}
+
+static void apply_output_gain(int32_t *samples, uint32_t frames) {
+  const int16_t left_gain_idx = (volume[1] / 256) + 96;
+  const int16_t right_gain_idx = (volume[2] / 256) + 96;
+  const int16_t master_gain_idx = (volume[0] / 256) + 96;
+  uint32_t left_gain_scaled = gain_lookup_table[left_gain_idx];
+  uint32_t right_gain_scaled = gain_lookup_table[right_gain_idx];
+  const uint32_t master_gain_scaled = gain_lookup_table[master_gain_idx];
+
+  if (mute[0] || mute[1]) left_gain_scaled = 0;
+  if (mute[0] || mute[2]) right_gain_scaled = 0;
+
+  for (uint32_t i = 0; i < frames; ++i) {
+    int64_t left = samples[i * 2u];
+    int64_t right = samples[i * 2u + 1u];
+
+    left = (left * left_gain_scaled) >> 31;
+    left = (left * master_gain_scaled) >> 31;
+    right = (right * right_gain_scaled) >> 31;
+    right = (right * master_gain_scaled) >> 31;
+
+    samples[i * 2u] = (int32_t)left;
+    samples[i * 2u + 1u] = (int32_t)right;
+  }
+}
+
 void audio_device_init(void) {
   g_current_state = STATE_STOPPED;
-
-  memset(&rb, 0, sizeof(ringbuffer_t));
+  memset(&rb, 0, sizeof(rb));
   ringbuffer_init(&rb, calc_buffer_size(current_sample_rate),
                   calc_buffer_size(SAMPLE_RATES[N_SAMPLE_RATES - 1]));
-
-  i2s_config = (i2s_config_t){
-      .data_pin = I2S_DATA_PIN,
-      .clock_pin_base = I2S_CLOCK_PIN_BASE,
-      .pio_instance = PIO,
-      .bit_depth = current_bit_depth,
-      .buffer_frames = current_sample_rate / 1000,
-      .sample_rate = current_sample_rate,
-  };
-
-  i2s_init(&i2s_config);
+  gpio_audio_link_set_local_sample_rate(current_sample_rate);
+  steady_buffer_fill_ratio = 0.0f;
   blink_set_period_us(1000000);
 }
 
-//--------------------------------------------------------------------+/
-// Main loop tasks
-//--------------------------------------------------------------------+/
 void audio_device_task(void) {
   switch (g_current_state) {
     case STATE_STOPPED:
@@ -111,9 +124,7 @@ void audio_device_task(void) {
 
     case STATE_BUFFERING:
       if (SAFE_WATER_LEVEL <= ringbuffer_fill_ratio(&rb)) {
-        LOG_DEBUG("Buffer reached safe level. Starting I2S playback....");
-        i2s_start(&i2s_config);
-        i2s_unmute();
+        LOG_INFO("Playback prebuffer ready; feeding the GPIO-link audio queue");
         g_current_state = STATE_PLAYING;
         blink_led_on();
       }
@@ -121,82 +132,70 @@ void audio_device_task(void) {
 
     case STATE_STALLED:
       if (RECOVERY_WATER_LEVEL <= ringbuffer_fill_ratio(&rb)) {
-        LOG_DEBUG("Buffer recovered. Resuming playback.");
+        LOG_INFO("Playback queue recovered");
         g_current_state = STATE_PLAYING;
         blink_led_on();
-      } else if (i2s_is_buffer_ready()) {
-        int32_t *i2s_buf = i2s_get_write_buffer();
-        const uint32_t frames = i2s_get_buffer_size_frames(&i2s_config);
-        memset(i2s_buf, 0, frames * sizeof(int32_t) * 2u);
-        i2s_submit_write_buffer();
       }
       break;
 
     case STATE_PLAYING:
-      if (i2s_is_buffer_ready()) {
-        int32_t *i2s_buf = i2s_get_write_buffer();
-        const uint32_t frames = i2s_get_buffer_size_frames(&i2s_config);
-        const uint32_t bytes_to_read = frames * sizeof(int32_t) * 2u;
-
-        const float buffer_level = steady_buffer_fill_ratio =
-            ringbuffer_fill_ratio(&rb);
-        if (buffer_level <= UNDERRUN_WATER_LEVEL) {
-          LOG_DEBUG("Underrun! Ratio: %.2f. Entering STALLED state.",
-                    buffer_level);
-          g_current_state = STATE_STALLED;
-          blink_set_period_us(250000);
-          memset(i2s_buf, 0, frames * sizeof(int32_t) * 2u);
-        } else {
-          static int32_t temp_buf[96 * 2];
-          assert(bytes_to_read <= sizeof(temp_buf));
-          ringbuffer_read(&rb, (uint8_t *)temp_buf, bytes_to_read);
-
-          const int16_t left_gain_idx = (volume[1] / 256) + 96;
-          const int16_t right_gain_idx = (volume[2] / 256) + 96;
-          const int16_t master_gain_idx = (volume[0] / 256) + 96;
-          uint32_t left_gain_scaled = gain_lookup_table[left_gain_idx];
-          uint32_t right_gain_scaled = gain_lookup_table[right_gain_idx];
-          const uint32_t master_gain_scaled =
-              gain_lookup_table[master_gain_idx];
-
-          if (mute[0] || mute[1]) left_gain_scaled = 0;
-          if (mute[0] || mute[2]) right_gain_scaled = 0;
-
-          for (uint32_t i = 0; i < frames; ++i) {
-            int64_t left = (int64_t)temp_buf[i * 2u];
-            int64_t right = (int64_t)temp_buf[i * 2u + 1u];
-
-            left = (left * left_gain_scaled) >> 31;
-            left = (left * master_gain_scaled) >> 31;
-            right = (right * right_gain_scaled) >> 31;
-            right = (right * master_gain_scaled) >> 31;
-
-            i2s_buf[2u * i] = (int32_t)left;
-            i2s_buf[2u * i + 1u] = (int32_t)right;
-          }
-        }
-        i2s_submit_write_buffer();
-      }
       break;
   }
+
+  if (g_current_state == STATE_PLAYING) {
+    const uint32_t target_frames =
+        (current_sample_rate * LINK_TX_TARGET_MS) / 1000u;
+
+    while (gpio_audio_link_get_tx_queued_frames() < target_frames) {
+      uint32_t queued = gpio_audio_link_get_tx_queued_frames();
+      uint32_t free_frames = gpio_audio_link_get_tx_free_frames();
+      uint32_t available_frames = playback_ring_frames();
+      if (free_frames == 0 || available_frames == 0) break;
+
+      uint32_t wanted = target_frames - queued;
+      if (wanted > LINK_TX_MAX_MOVE_FRAMES) wanted = LINK_TX_MAX_MOVE_FRAMES;
+      if (wanted > free_frames) wanted = free_frames;
+      if (wanted > available_frames) wanted = available_frames;
+      if (wanted == 0) break;
+
+      static int32_t temp_samples[LINK_TX_MAX_MOVE_FRAMES * 2u];
+      const uint32_t bytes = wanted * (uint32_t)STEREO_FRAME_BYTES;
+      const size_t read = ringbuffer_read(&rb, (uint8_t *)temp_samples, bytes);
+      const uint32_t frames_read = (uint32_t)(read / STEREO_FRAME_BYTES);
+      if (frames_read == 0) break;
+
+      apply_output_gain(temp_samples, frames_read);
+      if (gpio_audio_link_write_tx(temp_samples, frames_read) != frames_read) {
+        /* The transport queue is single-producer/single-consumer on core 0. */
+        LOG_ERROR("GPIO-link playback queue accepted fewer frames than requested");
+      }
+    }
+
+    if (ringbuffer_fill_ratio(&rb) <= UNDERRUN_WATER_LEVEL &&
+        gpio_audio_link_get_tx_queued_frames() <=
+            (current_sample_rate * LINK_TX_LOW_WATER_MS) / 1000u) {
+      LOG_WARN("Playback underrun; GPIO link will transmit silence until recovery");
+      g_current_state = STATE_STALLED;
+      blink_set_period_us(250000);
+    }
+  }
+
+  update_steady_fill_ratio();
 }
 
-//--------------------------------------------------------------------+/
-// Data flow
-//--------------------------------------------------------------------+/
 void audio_device_on_usb_rx(const int32_t *buffer, uint32_t num_samples) {
-  const uint32_t bytes = num_samples * sizeof(int32_t);
-  const size_t written = ringbuffer_write(&rb, (void *)buffer, bytes);
+  if (!buffer || num_samples == 0) return;
+  const uint32_t bytes = num_samples * (uint32_t)sizeof(int32_t);
+  const size_t written = ringbuffer_write(&rb, (const uint8_t *)buffer, bytes);
   if (written != bytes) {
-    LOG_DEBUG("bytes: %d, but written: %d", bytes, written);
+    LOG_DEBUG("Playback ring accepted %u of %u bytes", (unsigned)written,
+              (unsigned)bytes);
   }
-
-  if (g_current_state != STATE_PLAYING) {
-    steady_buffer_fill_ratio = ringbuffer_fill_ratio(&rb);
-  }
+  update_steady_fill_ratio();
 }
 
 float audio_device_get_steady_buffer_fill_ratio(void) {
+  update_steady_fill_ratio();
   return steady_buffer_fill_ratio;
 }
 
@@ -204,65 +203,38 @@ bool audio_device_is_playing(void) {
   return g_current_state == STATE_PLAYING;
 }
 
-//--------------------------------------------------------------------+/
-// Audio Stream State Control
-//--------------------------------------------------------------------+/
 void audio_device_stream_start(uint8_t bit_depth) {
   if (bit_depth != 16 && bit_depth != 24 && bit_depth != 32) {
-    LOG_ERROR("Unsupported I2S bit depth: %u", bit_depth);
+    LOG_ERROR("Unsupported USB playback bit depth: %u", bit_depth);
     return;
   }
 
-  LOG_INFO("Starting stream with %d bits, %lu Hz", bit_depth,
-           current_sample_rate);
-  current_bit_depth = bit_depth;
-
-  // A stream restart may arrive while a previous stream is still active.
-  // Stop only if it actually reached the running/stalled state.
   audio_device_stream_stop();
-  i2s_deinit(&i2s_config);
-
-  i2s_config = (i2s_config_t){
-      .data_pin = I2S_DATA_PIN,
-      .clock_pin_base = I2S_CLOCK_PIN_BASE,
-      .bit_depth = bit_depth,
-      .pio_instance = PIO,
-      .buffer_frames = current_sample_rate / 1000,
-      .sample_rate = current_sample_rate,
-  };
-  i2s_init(&i2s_config);
-
+  current_bit_depth = bit_depth;
+  gpio_audio_link_clear_tx();
+  ringbuffer_clear(&rb);
   ringbuffer_resize(&rb, calc_buffer_size(current_sample_rate));
+  gpio_audio_link_set_local_sample_rate(current_sample_rate);
   g_current_state = STATE_BUFFERING;
   blink_set_period_us(500000);
+  LOG_INFO("Starting USB %u-bit playback at %lu Hz (GPIO bitbang link carries S32 stereo)",
+           current_bit_depth, (unsigned long)current_sample_rate);
 }
 
 void audio_device_stream_stop(void) {
-  // USB hosts may issue redundant SET_INTERFACE/SET_CUR requests while the
-  // stream is already stopped. Do not touch the DMA/PIO hardware in that
-  // state: dma_channel_abort() is not part of a USB control-request path.
-  if (g_current_state == STATE_STOPPED) {
-    return;
+  if (g_current_state != STATE_STOPPED) {
+    LOG_DEBUG("Stopping USB playback stream");
   }
-
-  LOG_DEBUG("Stopping stream");
-
-  // BUFFERING has not started I2S/DMA yet. Only PLAYING and STALLED own an
-  // active transmit DMA stream and need a hardware stop.
-  if (g_current_state == STATE_PLAYING || g_current_state == STATE_STALLED) {
-    i2s_stop(&i2s_config);
-  }
-
   g_current_state = STATE_STOPPED;
+  ringbuffer_clear(&rb);
+  gpio_audio_link_clear_tx();
+  steady_buffer_fill_ratio = 0.0f;
   blink_set_period_us(1000000);
 }
 
-//--------------------------------------------------------------------+/
-// Audio Feature Control
-//--------------------------------------------------------------------+/
 void audio_device_set_mute(uint8_t channel, bool muted) {
   if (channel >= 3) return;
-  LOG_DEBUG("Set channel %d Mute: %d", channel, muted);
+  LOG_DEBUG("Set channel %u mute: %u", channel, muted ? 1u : 0u);
   mute[channel] = muted ? 1 : 0;
 }
 
@@ -273,9 +245,11 @@ bool audio_device_get_mute(uint8_t channel) {
 
 void audio_device_set_volume(uint8_t channel, int16_t volume_db_256) {
   if (channel >= 3) return;
-  if (volume_db_256 < -VOLUME_CTRL_96_DB) volume_db_256 = -VOLUME_CTRL_96_DB;
-  if (volume_db_256 > VOLUME_CTRL_0_DB) volume_db_256 = VOLUME_CTRL_0_DB;
-  LOG_DEBUG("Set channel %d volume: %d dB", channel, volume_db_256 / 256);
+  if (volume_db_256 < -VOLUME_CTRL_96_DB)
+    volume_db_256 = -VOLUME_CTRL_96_DB;
+  if (volume_db_256 > VOLUME_CTRL_0_DB)
+    volume_db_256 = VOLUME_CTRL_0_DB;
+  LOG_DEBUG("Set channel %u volume: %d dB", channel, volume_db_256 / 256);
   volume[channel] = volume_db_256;
 }
 
@@ -284,35 +258,26 @@ int16_t audio_device_get_volume(uint8_t channel) {
   return volume[channel];
 }
 
-void audio_device_get_volume_range(uint8_t channel, int16_t *min, int16_t *max,
-                                   int16_t *res) {
+void audio_device_get_volume_range(uint8_t channel, int16_t *min,
+                                   int16_t *max, int16_t *res) {
   (void)channel;
   if (min) *min = -VOLUME_CTRL_96_DB;
   if (max) *max = VOLUME_CTRL_0_DB;
   if (res) *res = 256;
 }
 
-//--------------------------------------------------------------------+/
-// Clock Control
-//--------------------------------------------------------------------+/
 void audio_device_set_sampling_freq(uint32_t freq) {
   if (!sample_rate_supported(freq)) {
     LOG_ERROR("Ignoring unsupported sample rate: %lu Hz", (unsigned long)freq);
     return;
   }
+  if (freq == current_sample_rate) return;
 
-  // Linux commonly writes the current rate back during stream setup. Treat
-  // that as an idempotent request; stopping the I2S/DMA engine here used to
-  // stall USB EP0 even though no clock change was necessary.
-  if (freq == current_sample_rate) {
-    return;
-  }
-
-  // Stop an actually running playback stream before changing its clock.
-  // When stopped, leave the initialized-but-idle I2S hardware alone.
   audio_device_stream_stop();
   current_sample_rate = freq;
-  LOG_INFO("Clock changed to %lu Hz", (unsigned long)freq);
+  gpio_audio_link_set_local_sample_rate(freq);
+  ringbuffer_resize(&rb, calc_buffer_size(current_sample_rate));
+  LOG_INFO("USB audio clock changed to %lu Hz", (unsigned long)freq);
 }
 
 uint32_t audio_device_get_sampling_freq(void) {

@@ -6,6 +6,7 @@
 #include "hardware/clocks.h"
 #include "log.h"
 #include "pico/stdlib.h"
+#include "gpio_audio_link.h"
 #include "usb.h"
 #include "usb_audio.h"
 #include "usb_audio_capture.h"
@@ -13,21 +14,26 @@
 
 int main(void) {
 #if PICO_RP2350
-  /*
-   * Use the standard 150 MHz RP2350 system clock. The 1.5 GHz PLL VCO
-   * is within the RP2350 limit; the PIO clock divider handles the I2S rate.
-   */
+  /* Standard 150 MHz RP2350 system clock. */
   set_sys_clock_pll(12 * MHZ * 125u, 5, 2);
 #else
-  /* 92.16 MHz gives an exact PIO divider for 48 kHz, 32-bit I2S slots. */
+  /* Retain the project's established RP2040 system clock configuration. */
   set_sys_clock_pll(12 * MHZ * 192u, 5, 5);
 #endif
 
   stdio_init_all();
 
+  /*
+   * The GPIO startup handshake is intentionally first. It blocks here until
+   * the other RP2350 board is present and has acknowledged GP16-GP19. USB
+   * UAC2 is not initialized or enumerated while the peer is absent.
+   */
+  gpio_audio_link_init();
+
 #ifndef PICODAC_NO_PIO_LED
   blink_init(pio1, PICO_DEFAULT_LED_PIN);
 #endif
+
   audio_device_init();
   audio_capture_init();
 
@@ -38,15 +44,16 @@ int main(void) {
   usb_hid_init();
 #endif
 
-#if defined(PICODAC_I2S_ROLE_SLAVE)
-  LOG_INFO("Booted: USB UAC2 playback + capture; I2S CLOCK SLAVE");
+#if defined(PICODAC_GPIO_LINK_ROLE_SLAVE)
+  LOG_INFO("Booted: USB UAC2 playback + capture; GPIO bitbang slave");
 #else
-  LOG_INFO("Booted: USB UAC2 playback + capture; I2S CLOCK MASTER");
+  LOG_INFO("Booted: USB UAC2 playback + capture; GPIO bitbang master");
 #endif
 
   while (true) {
     usb_device_task();
     audio_device_task();
+    gpio_audio_link_task();
     audio_capture_task();
   }
 }

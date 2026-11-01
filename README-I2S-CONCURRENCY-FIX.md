@@ -1,66 +1,96 @@
-# PicoAudio I2S concurrency and slave-underrun fix
+# PicoAudio I2S concurrency and clock-lifecycle fix
 
-This change addresses two hazards in the first two-board master/slave build.
+This update preserves the existing triple-buffer TX ownership fix and changes
+when the physical I2S clock generator runs.
 
-## 1. Slave TX no longer stalls on an empty FIFO
+## 1. Master clocks are independent of USB playback
 
-The previous slave PIO transmitter used autopull and could block an `OUT`
-instruction when the TX FIFO temporarily emptied. Unlike the master, the
-slave does not own BCLK: the master keeps clocking while the slave PIO is
-stalled. Missing those edges can shift the slave's outgoing bit stream and
-corrupt subsequent channel framing.
+The master now initializes its I2S transmitter as a 32-bit stereo-slot engine
+and starts the PIO/DMA clock source during `audio_device_init()`. It remains
+active while USB playback is stopped or has not yet started. When there are no
+queued audio blocks, DMA repeatedly supplies a permanent zero buffer, so the
+master continues generating BCLK and LRCLK without transmitting stale audio.
 
-The revised `i2s_slave.pio` uses explicit `PULL NOBLOCK` for each 32-bit
-channel word. If the FIFO is empty, it loads the zero held in X and transmits
-silence for that word. The PIO state machine continues to consume every
-external clock edge, preserving bit and channel alignment.
+Ordinary USB playback start/stop no longer deinitializes or reinitializes the
+master I2S hardware. Starting playback releases the DMA silence override and
+allows submitted audio blocks to be consumed. Stopping playback discards
+queued/filling application buffers and lets the current DMA block finish;
+the next DMA interrupt selects silence. The PIO clock generator is not
+stopped.
 
-## 2. TX DMA now uses an explicit three-buffer queue
+The master starts with 32-bit I2S slots because USB playback formats are
+normalized to signed 32-bit samples before entering the I2S transmit path.
+This keeps the clock rate and framing consistent from power-on, before a USB
+playback application opens the device.
 
-The previous TX path swapped two buffer pointers on every DMA interrupt and
-used one boolean to announce that a buffer was ready. If the main loop did not
-service that flag between consecutive DMA completions, the pointer swap could
-make a buffer writable while it was still queued for DMA.
+## 2. Stream restart cleanup
 
-The revised TX path has three owned buffers with explicit FREE, FILLING, READY,
-and DMA states. The main loop reserves, fills, and submits a block. The DMA
-interrupt alone selects queued blocks and releases a block only after DMA has
-read all of its source words. If no block is queued, DMA streams a permanent
-zero block. This avoids unsafe pointer swaps and keeps the master clock
-running during brief producer delays.
+Playback stream stop now flushes the application ring buffer. Stream start
+also clears it after resizing, and any final USB OUT packet delivered after
+the interface has stopped is ignored. This prevents samples left over from a
+previous USB session from being replayed when a later session starts.
+
+## 3. Sample-rate changes
+
+Changing between the supported 44.1 kHz and 48 kHz rates requires changing the
+master PIO clock divider. That operation intentionally deinitializes and
+reinitializes I2S once at the new rate. Master `i2s_init()` immediately
+restarts the clock generator afterward. This is distinct from ordinary USB
+playback open/close, which must not interrupt the clock link.
+
+## 4. TX buffer ownership
+
+The TX path continues to use three application buffers with explicit FREE,
+FILLING, READY, and DMA states. The main loop reserves, fills, and submits a
+block. The DMA interrupt releases a block only after DMA has consumed it and
+selects the next queued block. If no audio block is ready, DMA streams the
+permanent zero buffer.
+
+The slave transmitter retains its startup synchronization to external
+LRCLK/BCLK and `PULL NOBLOCK`, so an empty TX FIFO transmits zero rather than
+stalling on the master's clocks. The slave PIO state machine is restarted from
+its program entry when its local USB playback stream is restarted, allowing it
+to synchronize to the continuously-running master link.
 
 ## Files replaced
 
 - `i2s.c`
-- `i2s.h`
-- `i2s_slave.pio`
 - `audio_device.c`
+- `README-I2S-CONCURRENCY-FIX.md`
 
-`audio_device.c` now submits each completed DMA block explicitly. The CMake
-configuration from the master/slave role build already generates
-`i2s_slave.pio.h`; no CMake change is required.
+No pin assignments, USB descriptors, sample formats, or board roles change.
 
-## Build and flash
+## Build and deploy
 
-From the repository root:
+Build each Pico 2 W role separately:
 
 ```sh
-make build-bridge
+make build BOARD=pico2w ROLE=master
+make build BOARD=pico2w ROLE=slave
 ```
 
-Then deploy the matching role-specific images using the current role-aware
-workflow. The board roles and wiring do not change:
+Deploy one board at a time while it is in BOOTSEL:
 
-- Pico 2: I2S clock master
-- Pico 2 W: I2S clock slave
-- GP20 BCLK, GP21 LRCLK, GP22/GP26 crossed DATA, common GND
+```sh
+make deploy BOARD=pico2w ROLE=master
+make deploy BOARD=pico2w ROLE=slave
+```
 
-Do not change the wiring for this software update.
+Keep the established wiring unchanged:
 
-## Validation status
+- Master GP20 BCLK OUT -> Slave GP20 BCLK IN
+- Master GP21 LRCLK OUT -> Slave GP21 LRCLK IN
+- Master GP22 TX DATA -> Slave GP26 RX DATA
+- Slave GP22 TX DATA -> Master GP26 RX DATA
+- GND -> GND
 
-The changes are source-level fixes for identifiable FIFO-stall and DMA-buffer
-ownership hazards. The archive has not been compiled against the user's local
-Pico SDK or verified on the physical boards in this environment. A successful
-`make build-bridge` and repeat of the simultaneous bidirectional capture test
-are still required before considering the fix validated.
+Do not connect the boards' VBUS, VSYS, or 3V3 rails together.
+
+## Validation
+
+This is a source update intended to remove ordinary USB playback start/stop
+from the I2S clock lifecycle and prevent old playback samples from carrying
+across USB sessions. It still needs to be built with the project's local Pico
+SDK, flashed to both physical boards, and verified with repeated and longer
+simultaneous playback/capture tests. A successful build alone does not
+establish audio stability.

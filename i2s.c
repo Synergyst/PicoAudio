@@ -59,6 +59,8 @@ static volatile int8_t cpu_filling_buffer = -1;
 static volatile uint current_dma_channel;
 
 static volatile bool dma_running = false;
+/* Master mode keeps DMA active and selects silence whenever USB playback is idle. */
+static volatile bool dma_force_silence = false;
 static bool pio_running = false;
 static bool initialized = false;
 
@@ -74,6 +76,7 @@ static void tx_buffers_reset(void) {
   ready_count = 0;
   dma_active_buffer = -1;
   cpu_filling_buffer = -1;
+  dma_force_silence = false;
 }
 
 static void dma_irq_handler(void) {
@@ -91,7 +94,7 @@ static void dma_irq_handler(void) {
   }
 
   int8_t next_buffer = -1;
-  if (ready_count != 0u) {
+  if (!dma_force_silence && ready_count != 0u) {
     next_buffer = (int8_t)ready_queue[ready_tail];
     ready_tail = (uint8_t)((ready_tail + 1u) % I2S_TX_BUFFER_COUNT);
     --ready_count;
@@ -142,6 +145,7 @@ static void dma_start(const i2s_config_t *config) {
   uint32_t irq_state = save_and_disable_interrupts();
   tx_buffers_reset();
   dma_running = true;
+  dma_force_silence = false;
   dma_irqn_acknowledge_channel(DMA_IRQ_INDEX, current_dma_channel);
   dma_irqn_set_channel_enabled(DMA_IRQ_INDEX, current_dma_channel, true);
   restore_interrupts(irq_state);
@@ -267,6 +271,16 @@ void i2s_init(const i2s_config_t *config) {
   dma_init(config);
 
   initialized = true;
+
+#if defined(PICODAC_I2S_ROLE_MASTER)
+  /*
+   * The master owns the physical clock domain, not the USB playback
+   * interface. Start it during device initialization and keep it running
+   * with silence whenever no USB audio buffers are queued.
+   */
+  i2s_start(config);
+#endif
+
   TRACE_LOG("i2s_init end\n");
 }
 
@@ -289,19 +303,59 @@ void i2s_start(const i2s_config_t *config) {
   }
   TRACE_LOG("i2s_start begin\n");
   i2s_unmute();
-  dma_start(config);
+
+  if (dma_running) {
+    /* Resume queued audio without restarting the PIO clock generator. */
+    uint32_t irq_state = save_and_disable_interrupts();
+    dma_force_silence = false;
+    restore_interrupts(irq_state);
+  } else {
+    dma_start(config);
+  }
+
   pio_start(config);
   TRACE_LOG("i2s_start end\n");
 }
 
 void i2s_stop(const i2s_config_t *config) {
-  if (!initialized || (!dma_running && !pio_running)) {
+  if (!initialized) {
     return;
   }
+
   TRACE_LOG("i2s_stop begin\n");
   i2s_mute();
+
+#if defined(PICODAC_I2S_ROLE_MASTER)
+  /*
+   * USB playback stopping must not stop the shared I2S clock. Discard any
+   * queued/filling audio and let the current DMA block finish; the next DMA
+   * interrupt switches to the permanent silence buffer. BCLK/LRCLK and the
+   * DMA cadence therefore continue uninterrupted between USB sessions.
+   */
+  uint32_t irq_state = save_and_disable_interrupts();
+  dma_force_silence = true;
+  for (uint8_t i = 0; i < I2S_TX_BUFFER_COUNT; ++i) {
+    if (buffer_state[i] == I2S_TX_BUFFER_READY ||
+        buffer_state[i] == I2S_TX_BUFFER_FILLING) {
+      buffer_state[i] = I2S_TX_BUFFER_FREE;
+    }
+  }
+  ready_head = 0;
+  ready_tail = 0;
+  ready_count = 0;
+  cpu_filling_buffer = -1;
+  __dmb();
+  restore_interrupts(irq_state);
+#else
+  /* The slave follows external clocks and may stop driving its DATA pin. */
+  if (!dma_running && !pio_running) {
+    TRACE_LOG("i2s_stop end (already stopped)\n");
+    return;
+  }
   dma_stop();
   pio_stop(config);
+#endif
+
   TRACE_LOG("i2s_stop end\n");
 }
 
