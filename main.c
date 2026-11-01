@@ -1,5 +1,6 @@
 #include <stdint.h>
 
+#include "audio_capture.h"
 #include "audio_device.h"
 #include "blink.h"
 #include "hardware/clocks.h"
@@ -7,30 +8,42 @@
 #include "pico/stdlib.h"
 #include "usb.h"
 #include "usb_audio.h"
+#include "usb_audio_capture.h"
 #include "usb_hid.h"
 
-int main() {
-  // CPU 周波数が標準の 125 MHz だと PIO のクロック分周に誤差が出る
-  // そのため 48kHz/96kHz で都合が良いように 126 MHz を設定
-  // set_sys_clock_khz(126000, true);
-  // 92.16MHz だと整数分周になる
+int main(void) {
+#if PICO_RP2350
+  /*
+   * Use the standard 150 MHz RP2350 system clock. The 1.5 GHz PLL VCO
+   * is within the RP2350 limit; the PIO clock divider handles the I2S
+   * sample rate from this system clock.
+   */
+  set_sys_clock_pll(12 * MHZ * 125u, 5, 2);
+#else
+  /* 92.16 MHz gives an exact PIO divider for 48 kHz, 32-bit I2S slots. */
   set_sys_clock_pll(12 * MHZ * 192u, 5, 5);
+#endif
 
   stdio_init_all();
 
+#ifndef PICODAC_NO_PIO_LED
   blink_init(pio1, PICO_DEFAULT_LED_PIN);
+#endif
   audio_device_init();
+  audio_capture_init();
+
   usb_device_init();
   usb_audio_init();
+  usb_audio_capture_init();
 #ifdef HID_ENABLE
   usb_hid_init();
 #endif
 
-  LOG_INFO("Booted");
+  LOG_INFO("Booted: USB UAC2 playback + capture");
 
   while (true) {
     usb_device_task();
-
     audio_device_task();
+    audio_capture_task();
   }
 }

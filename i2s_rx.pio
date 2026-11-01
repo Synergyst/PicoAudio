@@ -1,0 +1,38 @@
+.program i2s_rx
+; Digital I2S receiver for 32-bit stereo slots.
+; GPIO20 = BCLK, GPIO21 = LRCLK, data input pin is supplied by C.
+;
+; The pico-dac2 TX PIO changes LRCLK on the boundary bit while it outputs
+; the previous channel's LSB. The following BCLK rising edge samples that
+; previous LSB. Skip that single edge once when synchronizing, then receive
+; the following 32 left-channel bits and 32 right-channel bits continuously.
+;
+; IMPORTANT: Do not re-synchronize/skip a BCLK edge between left and right.
+; The TX program has already accounted for the I2S one-bit boundary delay.
+
+    ; Synchronize to the LRCLK high-to-low boundary (start of left slot).
+    wait 1 gpio 21
+    wait 0 gpio 21
+
+    ; Discard the boundary edge, which samples the previous right-channel LSB.
+    wait 1 gpio 20
+    wait 0 gpio 20
+
+.wrap_target
+    ; Left channel: 32 bits, MSB first.
+    set x, 31
+left_bit:
+    wait 1 gpio 20
+    in pins, 1
+    wait 0 gpio 20
+    jmp x-- left_bit
+
+    ; Right channel begins on the very next BCLK rising edge.
+    ; No extra edge is discarded here.
+    set x, 31
+right_bit:
+    wait 1 gpio 20
+    in pins, 1
+    wait 0 gpio 20
+    jmp x-- right_bit
+.wrap
