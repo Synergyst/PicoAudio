@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(APP_NAME "mdac_adc2")
-set(BOARD_NAME "rp2350" CACHE STRING "Target SoC: rp2350 (required for Cortex-M33 assembly transport)")
+set(BOARD_NAME "rp2350" CACHE STRING "Target SoC: rp2350 (Pico 2 / Pico 2 W)")
 set(PICODAC_LINK_ROLE "master" CACHE STRING "GPIO bitbang link role: master or slave")
 set_property(CACHE PICODAC_LINK_ROLE PROPERTY STRINGS master slave)
 set(PICODAC_VENDOR_ID 0xcafe CACHE STRING "USB Vendor ID")
@@ -14,7 +14,7 @@ set(PICODAC_PRODUCT_ID 0xbabe CACHE STRING "USB Product ID")
 if(BOARD_NAME STREQUAL "rp2350")
     set(_default_pico_board pico2)
 else()
-    message(FATAL_ERROR "Unsupported BOARD_NAME='${BOARD_NAME}'. This cycle-counted GPIO assembly transport requires RP2350 (pico2 or pico2w).")
+    message(FATAL_ERROR "Unsupported BOARD_NAME='${BOARD_NAME}'. This C-only GPIO diagnostic build requires RP2350 (pico2 or pico2w).")
 endif()
 
 if(NOT PICODAC_LINK_ROLE STREQUAL "master" AND NOT PICODAC_LINK_ROLE STREQUAL "slave")
@@ -48,14 +48,11 @@ add_executable(mdac_adc2
     blink.c
     ringbuffer.c
     gpio_audio_link.c
-    gpio_audio_link_bitbang.S
     usb.c
     usb_audio.c
     usb_audio_capture.c
     usb_hid.c
 )
-
-set_source_files_properties(gpio_audio_link.c PROPERTIES COMPILE_OPTIONS "-O3")
 
 target_link_libraries(mdac_adc2
     hardware_pio
@@ -87,7 +84,7 @@ pico_generate_pio_header(mdac_adc2
 )
 
 pico_set_program_name(mdac_adc2 "mdac_adc2")
-pico_set_program_version(mdac_adc2 "0.7-gpio-bitbang-asm")
+pico_set_program_version(mdac_adc2 "0.8-gpio-c-diagnostic")
 pico_enable_stdio_uart(mdac_adc2 1)
 pico_enable_stdio_usb(mdac_adc2 0)
 pico_add_extra_outputs(mdac_adc2)

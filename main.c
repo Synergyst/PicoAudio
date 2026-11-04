@@ -45,9 +45,9 @@ int main(void) {
 #endif
 
 #if defined(PICODAC_GPIO_LINK_ROLE_SLAVE)
-  LOG_INFO("Booted: USB UAC2 playback + capture; GPIO bitbang slave");
+  LOG_INFO("Booted: USB UAC2 endpoints; GPIO C diagnostic slave (PCM disabled)");
 #else
-  LOG_INFO("Booted: USB UAC2 playback + capture; GPIO bitbang master");
+  LOG_INFO("Booted: USB UAC2 endpoints; GPIO C diagnostic master (PCM disabled)");
 #endif
 
   while (true) {

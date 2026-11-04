@@ -4,7 +4,7 @@ SHELL := /bin/bash
 CMAKE ?= cmake
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-# The cycle-counted GPIO bitbang transport is an RP2350/Cortex-M33 build.
+# The Stage-1 C GPIO diagnostic is an RP2350 build.
 BOARD ?=
 ROLE ?=
 BUILD_ROLE := $(if $(strip $(ROLE)),$(strip $(ROLE)),master)
@@ -15,7 +15,7 @@ DEVICE ?=
 
 help:
 	@printf '%s\n' \
-	  'PicoAudio full-duplex USB audio firmware (RP2350 GPIO bitbang transport)' \
+	  'PicoAudio RP2350 GPIO C diagnostic firmware (PCM transport disabled)' \
 	  '' \
 	  'Generic build:' \
 	  '  make build BOARD=pico2 ROLE=slave' \
@@ -33,7 +33,8 @@ help:
 	  '  make deploy BOARD=pico2w ROLE=master' \
 	  '  make status             Show BOOTSEL volumes and running PicoAudio devices' \
 	  '' \
-	  'This assembly-timed GPIO transport requires RP2350 (Pico 2 / Pico 2 W).'
+	  'This C-only GPIO diagnostic requires RP2350 (Pico 2 / Pico 2 W).' \
+	  'It verifies the 1:1 GPIO link before exposing UAC2; PCM forwarding is disabled.'
 
 all: build
 
@@ -50,7 +51,7 @@ build-one:
 	case "$$board" in \
 	  pico2) soc=rp2350; pico_board=pico2 ;; \
 	  pico2w) soc=rp2350; pico_board=pico2_w ;; \
-	  *) echo "Unsupported BOARD='$$board'. This GPIO assembly transport requires pico2 or pico2w (RP2350)." >&2; exit 2 ;; \
+	  *) echo "Unsupported BOARD='$$board'. This C GPIO diagnostic requires pico2 or pico2w (RP2350)." >&2; exit 2 ;; \
 	esac; \
 	case "$$role" in master|slave) ;; *) echo "Unsupported ROLE='$$role'. Use master or slave." >&2; exit 2 ;; esac; \
 	case "$$board-$$role" in \
